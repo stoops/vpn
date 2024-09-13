@@ -1,0 +1,300 @@
+
+int wrap(ciph_o *cptr, unsigned char *data, unsigned char *buff, int leng, char mode) {
+	numb_u csum, hsum;
+	char_u *ptra = data, *ptrb = buff;
+	ciph_h *head = &(cptr->h);
+	int size = leng, olen = leng;
+	int hlen = sizeof(ciph_h);
+	if (cptr->q == NULL) { return 0; }
+	if (mode == 'e') {
+		for (int x = 0; x < 16; ++x) {
+			cptr->v[x] = LETS[rand()%LLEN];
+		}
+		bcopy(cptr->v, head->i, 16);
+		ptra += hlen; size += hlen;
+	} else {
+		bcopy(buff, head, hlen);
+		bcopy(head->i, cptr->v, 16);
+		ptrb += hlen; size -= hlen;
+		UPACK16(leng, head->l); size = leng;
+	}
+	if ((size < 1) || (BUDP < size) || (leng < 1) || (BUDP < leng)) {
+		return -1;
+	}
+	init(cptr);
+	ciph(ptra, ptrb, leng, &(cptr->i), &(cptr->j), &(cptr->k), cptr->s, mode);
+	sums(&(csum), cptr->s, cptr->i, cptr->j, cptr->k);
+	if (mode == 'e') {
+		PACKU32(head->c, csum);
+		PACKU16(head->l, olen);
+		bcopy(head, data, hlen);
+	} else {
+		UPACK32(hsum, head->c);
+		if (csum != hsum) {
+			return -2;
+		}
+	}
+	return size;
+}
+
+#define RTRY -3
+#define STRY -4
+#define RACK -5
+#define SACK -6
+
+#define TRYL 60042
+#define ACKL 60009
+
+typedef struct header_packet {
+	char_u prot, pnum, nump;
+	char_u sadr[4], sprt[2], dadr[4], dprt[2];
+	char_u pkti[4], idxp[4], plen[2], leng[2];
+} pckt_h;
+
+typedef struct list_buffer {
+	int stat, nump, leng, full;
+	int part[LIST];
+	numb_u xpid, pidx;
+	char_u buff[LIST][BUDP];
+} buff_l;
+
+int xmit(thrd_o *args, unsigned char *buff, int leng, int ptid, char mode) {
+	int i = 1;
+	if (mode == 's') { i = 0; }
+	int kind = args->kind[i];
+	int sock = args->sock[i];
+	struct sockaddr_in *addr = &(args->addr[i]);
+	pckt_h *head = &(args->head[i]);
+	ciph_o *ciph = &(args->ciph[i]);
+
+	int indx = 0, size = 0, pnum = 0, nump = 0;
+	int widx = 0, wlen = 0, modn = 0, retl = 0;
+	int maxd = (MAXP + MINP), maxh = sizeof(pckt_h);
+	int slen = sizeof(struct sockaddr_in);
+	unsigned char data[BUDP], temp[BUDP];
+	time_t secs = time(NULL);
+
+	int stop = 0, show = 0;
+	unsigned int xpid = args->ptid[ptid][0], pidx = args->ptid[ptid][1];
+	char_u *pntr = data;
+
+	if (args->excl == 1) {
+		if (kind == SOCK_DGRAM) {
+			wlen = sendto(sock, buff, leng, 0, (struct sockaddr *)addr, slen);
+		} else {
+			wlen = sent(sock, buff, leng);
+		}
+		args->last = secs;
+		return wlen;
+	}
+
+	if (leng == FINX) { leng = 1; stop = FINX; }
+	if (leng == PING) { leng = 2; stop = PING; }
+
+	nump = (leng / maxd); modn = (leng % maxd);
+	if (modn != 0) { nump += 1; }
+	PACKU32(head->pkti, xpid);
+	PACKU32(head->idxp, pidx);
+	PACKU16(head->leng, leng);
+	widx = maxm(head->prot, 2, 0);
+
+	if (stop == FINX) { PACKU16(head->leng, FINL); }
+	if (stop == PING) { PACKU16(head->leng, PINL); }
+
+	indx = 0; show = (secs - args->lock[0]);
+	if (stop != 0) { show = 1; }
+	while ((indx < leng) && (pnum < nump)) {
+		for (size = maxh; (indx < leng) && (size < (maxd + maxh)); ++size) {
+			data[size] = buff[indx]; ++indx;
+		}
+		wlen = (size - maxh);
+		if (wlen < 1) { break; }
+		head->pnum = pnum;
+		head->nump = nump;
+		PACKU16(head->plen, wlen);
+		bcopy(head, data, maxh);
+		wlen = wrap(ciph, temp, data, size, 'e');
+		if (wlen > 0) {
+			pntr = temp; size = wlen;
+			while (size < BUDP) { pntr[size] = 0; ++size; }
+		}
+		if (wlen < 0) { break; }
+		if (show >= 1) {
+			printf("[%s] info xmit snd %s [%d] [%d/%d] [%d/%d] [%d] [0x%08x:%u] [%s:%d]->[%s:%d]\n", getd(), PMAP[widx], stop, pnum + 1, nump, indx, leng, size, xpid, pidx, args->adrs[0], args->port[0], args->adrs[1], args->port[1]);
+			args->lock[0] = secs;
+		}
+		wlen = sent(sock, pntr, BUDP);
+		if (wlen < 1) { break; }
+		++pnum; retl += wlen;
+	}
+	if (stop == 0) {
+		++pidx; args->ptid[ptid][1] = pidx;
+		args->last = secs;
+	}
+
+	return retl;
+}
+
+void xfin(thrd_o *args, int rprt, int stat) {
+	char mode = 'c';
+	int side = 1, indx = 0, leng = 0;
+	if (stat == FINX) { leng = FINX; indx = 4; }
+	if (stat == PING) { leng = PING; indx = 5; }
+	if (stat == RTRY) { leng = RTRY; indx = 6; }
+	if (stat == STRY) { leng = STRY; indx = 7; }
+	if (stat == RACK) { leng = RACK; indx = 8; }
+	if (stat == SACK) { leng = SACK; indx = 9; }
+	if ((leng < 0) && (args->excl == 0)) {
+		if ((stat == FINX) || (stat == PING)) { args->ptid[indx][0] = 0; args->ptid[indx][1] = 0; }
+		if (rprt == 0) { mode = 's'; side = 0; }
+		xmit(args, args->buff[side], leng, indx, mode);
+	}
+}
+
+int xbuf(thrd_o *args, buff_l *bufs, unsigned char *buff, int leng, int ptid, char mode) {
+	int i = 1;
+	if (mode == 's') { i = 0; }
+	int kind = args->kind[i];
+	int sock = args->sock[i];
+	struct sockaddr_in *addr = &(args->addr[i]);
+	pckt_h *head = &(args->head[i]);
+	ciph_o *ciph = &(args->ciph[i]);
+
+	int pnum, nump, size, rlen, wlen, plen;
+	int widx = 0, oidx = 0, fidx = 0, show = 0, retl = 0;
+	int hlen = sizeof(pckt_h), clen = sizeof(ciph_h);
+	int slen = sizeof(struct sockaddr_in);
+	int olen = hlen;
+	unsigned int xpid, pidx;
+	unsigned char data[BTCP];
+	time_t secs = time(NULL);
+	char_u *pntr = buff;
+	buff_l *bptr = NULL;
+
+	wlen = wrap(ciph, data, buff, leng, 'd');
+	if (wlen > 0) { pntr = data; leng = wlen; olen += clen; }
+	if (wlen < 0) { return 0; }
+
+	bcopy(pntr, head, hlen);
+	UPACK32(xpid, head->pkti);
+	UPACK32(pidx, head->idxp);
+	UPACK16(plen, head->plen);
+	UPACK16(size, head->leng);
+	leng = plen;
+	pnum = head->pnum;
+	nump = head->nump;
+	pntr = (pntr + hlen);
+	widx = maxm(head->prot, 2, 0);
+
+	if (size == FINL) {
+		return -9;
+	}
+	if (size == PINL) {
+		return 0;
+	}
+	if ((leng < 1) || (BUDP < leng) || (plen < 1) || (BUDP < plen)) {
+		return -8;
+	}
+	if ((nump < 1) || (LIST < nump) || (pnum <= -1) || (nump <= pnum)) {
+		return -7;
+	}
+	if ((size < 1) || (BTCP < size) || (xpid < 1) || (pidx < 1)) {
+		return -6;
+	}
+
+	if ((nump < 2) && (kind == SOCK_DGRAM)) { pidx = 0; }
+
+	if ((nump > 1) || (kind == SOCK_STREAM)) {
+		if (kind == SOCK_STREAM) { oidx = maxs(1, args->ptid[ptid][1]); }
+	}
+
+	if ((nump > 1) || (pidx != oidx)) {
+		for (int x = 0; (x < MINT) && (bptr == NULL); ++x) {
+			if (bufs[x].xpid == xpid) {
+				bptr = &(bufs[x]);
+			}
+		}
+		if (bptr == NULL) {
+			args->indx = ((args->indx + 1) % MINT);
+			bptr = &(bufs[args->indx]);
+		}
+
+		bptr->stat = OKOP;
+		bptr->xpid = xpid; bptr->pidx = pidx;
+		bptr->nump = nump; bptr->leng = size;
+		bptr->part[pnum] = plen;
+		bcopy(pntr, &(bptr->buff[pnum]), plen);
+
+		wlen = OKOP;
+		for (int x = 0; x < nump; ++x) {
+			if (bptr->part[x] < 1) { wlen = NOOP; break; }
+		}
+		bptr->full = wlen;
+
+		fidx = -1;
+	}
+
+	show = (secs - args->lock[1]);
+	while (1) {
+		bptr = NULL;
+		if (fidx < 0) {
+			fidx = -2; rlen = 0; pnum = 0;
+			for (int x = 0; (x < MINT) && (pidx > 0); ++x) {
+				if ((kind == SOCK_DGRAM) || ((bufs[x].xpid == xpid) && (bufs[x].pidx == oidx))) {
+					if (bufs[x].full == OKOP) {
+						bptr = &(bufs[x]); pntr = data;
+						nump = bptr->nump; size = bptr->leng;
+						fidx = -1; break;
+					}
+				}
+			}
+		} else { rlen = leng; size = leng; pnum = 0; nump = 1; plen = 0; }
+		if (fidx == -2) { break; }
+		while (pnum < nump) {
+			if (bptr != NULL) { plen = bptr->part[pnum]; }
+			if (show >= 1) {
+				printf("[%s] info xbuf rcv %s [%d] [%d/%d] [%d/%d] [%d] [0x%08x:%u] [%s:%d]->[%s:%d]\n", getd(), PMAP[widx], fidx, pnum + 1, nump, rlen + plen, size, plen + olen, xpid, pidx, args->adrs[0], args->port[0], args->adrs[1], args->port[1]);
+				args->lock[1] = secs;
+			}
+			if (bptr != NULL) {
+				for (int y = 0; (y < plen) && (rlen < BTCP); ++y) {
+					data[rlen] = bptr->buff[pnum][y]; ++rlen;
+				}
+			}
+			++pnum;
+		}
+		if (bptr != NULL) { bzero(bptr, sizeof(buff_l)); }
+		if (kind == SOCK_DGRAM) {
+			wlen = sendto(sock, pntr, rlen, 0, (struct sockaddr *)addr, slen);
+		} else {
+			wlen = sent(sock, pntr, rlen);
+		}
+		if (wlen < 1) { return -5; }
+		fidx = -1; retl += wlen;
+		if (pidx > 0) {
+			++oidx; args->ptid[ptid][1] = oidx;
+		}
+	}
+
+	args->last = secs;
+	return retl;
+}
+
+	else {
+		leng = recq(args->conn, pbuf, BTCP);
+		bcopy(pbuf, data, leng);
+		wlen = wrap(ciph, data, BMAX, pbuf, leng, 'd');
+		if (wlen > hlen) { leng = (wlen - hlen); }
+		if (wlen < 0) {
+			printf("[%s] warn prep wrap [%d] [%d]\n", getd(), sock, conn);
+			if (conn != sock) { fins(&(conn), 1); }
+			args->stat |= ENDP; return NULL;
+		}
+		bcopy(data, head, hlen);
+		snprintf(cons, ILEN, "%d.%d.%d.%d", head->sadr[3], head->sadr[2], head->sadr[1], head->sadr[0]);
+		UPACK16(port, head->sprt);
+	}
+
+	if (kind == SOCK_STREAM) {
+		printf("[%s] info prep loop %s [%d] [0x%08x] [%d:%d] [%s:%d]\n", getd(), argv->prot, leng, thid, indx, this, cons, port);
+	}
